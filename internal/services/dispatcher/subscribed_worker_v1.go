@@ -149,11 +149,13 @@ func (worker *subscribedWorker) sendToWorkerWithStream(
 		return newWorkerSendError(dispatchFailureSendLockTimeout, errFlowControlActive)
 	}
 
+	if err := ctx.Err(); err != nil {
+		worker.sendLock.Release()
+		return newWorkerSendError(dispatchFailureContextDone, err)
+	}
+
 	lockBegin := time.Now()
-
 	_, lockSpan := telemetry.NewSpan(ctx, "acquire-worker-stream-lock")
-
-	defer worker.sendLock.Release()
 	defer lockSpan.End()
 
 	telemetry.WithAttributes(span, telemetry.AttributeKV{
@@ -169,8 +171,10 @@ func (worker *subscribedWorker) sendToWorkerWithStream(
 	sentCh := make(chan error, 1)
 
 	go func() {
-		defer close(sentCh)
+		// A caller can time out while the transport is still writing. Only the
+		// writer can release admission for the next send on this worker.
 		err := worker.stream.Send(action)
+		worker.sendLock.Release()
 
 		if err != nil {
 			span.RecordError(err)

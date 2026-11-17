@@ -34,6 +34,7 @@ async def main(address, worker, scenario, target, barrier):
         nonlocal opens
         stream = await connect()
         opens += 1
+        first_connection = opens == 1
         claim_rpc = client.aio_client.ClaimDelivery
         read = stream.read
 
@@ -52,6 +53,12 @@ async def main(address, worker, scenario, target, barrier):
 
         async def claim(request, **kwargs):
             nonlocal dropped
+            if (
+                first_connection
+                and scenario in ("lost_reply", "lost_receipt")
+                and dropped
+            ):
+                raise LostReply()  # The failed connection never recovers.
             if scenario == "lost_receipt" and not dropped:
                 dropped = True
                 claims.append((request.receipt_id, None))
@@ -98,9 +105,9 @@ async def main(address, worker, scenario, target, barrier):
     if scenario == "lost_start":
         assert opens >= 2, opens
     elif scenario == "lost_receipt":
-        assert claims[0][0] == claims[1][0] and claims[1][1], claims
+        assert opens >= 2 and claims[0][0] == claims[1][0], claims
     elif scenario == "lost_reply":
-        assert claims[0] == claims[1] and claims[0][1], claims
+        assert opens >= 2 and claims[0] == claims[1] and claims[0][1], claims
     elif scenario == "heartbeat_replay":
         assert opens == 1, opens
     client.stop_stream()

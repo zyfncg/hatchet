@@ -148,38 +148,14 @@ class ActionListener:
 
         self.heartbeat_task = loop.create_task(self.heartbeat())
 
-    async def _claim_delivery(self, action: AssignedAction) -> bool:
-        # One nonce per received copy. If the reply gets lost, retry the same
-        # nonce so the engine can distinguish this caller from a duplicate.
-        request = ClaimDeliveryRequest(
-            worker_id=self.worker_id,
-            listener_session_id=action.listener_session_id,
-            delivery_id=action.delivery_id,
-            receipt_id=str(uuid4()),
-        )
-        while not self.stop_signal:
-            try:
-                response = await self.aio_client.ClaimDelivery(
-                    request, timeout=5, metadata=create_authorization_header(self.token)
-                )
-                return bool(response.accepted)
-            except grpc.RpcError as exc:  # noqa: PERF203
-                if exc.code() not in (
-                    grpc.StatusCode.UNAVAILABLE,
-                    grpc.StatusCode.DEADLINE_EXCEEDED,
-                    grpc.StatusCode.CANCELLED,
-                    grpc.StatusCode.INTERNAL,
-                    grpc.StatusCode.UNKNOWN,
-                ):
-                    raise
-                await asyncio.sleep(0.25)
-        return False
-
     def __aiter__(self) -> AsyncGenerator[Action | None, None]:
         return self._generator()
 
     async def _generator(self) -> AsyncGenerator[Action | None, None]:
         listener = None
+        # A lost claim reply can mean the engine has already committed the receipt.
+        # Keep both the action and the exact request until its outcome is known.
+        pending: tuple[ClaimDeliveryRequest, Action] | None = None
 
         while not self.stop_signal:
             if listener is not None:
@@ -190,13 +166,23 @@ class ActionListener:
             except Exception:
                 logger.info("closing action listener loop")
                 yield None
+                return
 
             try:
                 while not self.stop_signal:
-                    self.interrupt = ThreadSafeEvent()
-
-                    if listener is None:
+                    if pending is not None:
+                        request, action = pending
+                        response = await self.aio_client.ClaimDelivery(
+                            request,
+                            timeout=5,
+                            metadata=create_authorization_header(self.token),
+                        )
+                        pending = None
+                        if response.accepted:
+                            yield action
                         continue
+
+                    self.interrupt = ThreadSafeEvent()
 
                     t = asyncio.create_task(
                         read_with_interrupt(listener, self.interrupt)
@@ -305,13 +291,33 @@ class ActionListener:
                         batch_start=batch_start_payload,
                     )
 
-                    if assigned_action.delivery_id and not await self._claim_delivery(
-                        assigned_action
-                    ):
-                        continue
-                    yield action
+                    if assigned_action.delivery_id:
+                        pending = (
+                            ClaimDeliveryRequest(
+                                worker_id=self.worker_id,
+                                listener_session_id=assigned_action.listener_session_id,
+                                delivery_id=assigned_action.delivery_id,
+                                receipt_id=str(uuid4()),
+                            ),
+                            action,
+                        )
+                    else:
+                        yield action
             except grpc.RpcError as e:
                 self.last_heartbeat_succeeded = False
+
+                if pending is not None:
+                    if e.code() not in (
+                        grpc.StatusCode.UNAVAILABLE,
+                        grpc.StatusCode.DEADLINE_EXCEEDED,
+                        grpc.StatusCode.CANCELLED,
+                        grpc.StatusCode.INTERNAL,
+                        grpc.StatusCode.UNKNOWN,
+                    ):
+                        raise
+                    self.retries += 1
+                    logger.debug("claim interrupted; reconnecting to confirm receipt")
+                    continue
 
                 # Handle different types of errors
                 if e.code() == grpc.StatusCode.CANCELLED:

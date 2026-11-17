@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/hatchet-dev/hatchet/internal/services/dispatcher/contracts/contractsconnect"
@@ -71,7 +71,20 @@ func TestRecoverWorkerStart(t *testing.T) {
 				}
 				t.Log(output.String())
 			}()
-			require.Eventually(t, func() bool { _, err := engine.workers.Get(worker); return err == nil }, 10*time.Second, 10*time.Millisecond)
+			currentListener := func(previous uuid.UUID) *subscribedWorker {
+				t.Helper()
+				var listener *subscribedWorker
+				require.EventuallyWithT(t, func(c *assert.CollectT) {
+					var id uuid.UUID
+					err := pool.QueryRow(ctx, `SELECT "lastListenerSessionId" FROM "Worker" WHERE id=$1 AND "isActive"`, worker).Scan(&id)
+					require.NoError(c, err)
+					require.NotEqual(c, previous, id)
+					listener, err = engine.workers.GetForSession(worker, id)
+					require.NoError(c, err)
+				}, 10*time.Second, 10*time.Millisecond)
+				return listener
+			}
+			active := currentListener(uuid.Nil)
 			release := sqlcv1.ReleaseTasksParams{}
 			var delivery, receipt, session uuid.UUID
 			for _, external := range []uuid.UUID{target, barrier} {
@@ -86,9 +99,7 @@ func TestRecoverWorkerStart(t *testing.T) {
 				release.Taskids = append(release.Taskids, task.ID)
 				release.Taskinsertedats = append(release.Taskinsertedats, task.InsertedAt)
 				release.Retrycounts = append(release.Retrycounts, task.RetryCount)
-				active, err := engine.workers.Get(worker)
-				require.NoError(t, err)
-				require.NoError(t, active[0].StartTaskFromBulk(ctx, tenant, &repository.V1TaskWithPayload{V1Task: task, Payload: []byte("{}")}, nil))
+				require.NoError(t, active.StartTaskFromBulk(ctx, tenant, &repository.V1TaskWithPayload{V1Task: task, Payload: []byte("{}")}, nil))
 				require.Eventually(t, func() bool {
 					var claimed bool
 					err := pool.QueryRow(ctx, `SELECT receipt_id IS NOT NULL FROM v1_worker_delivery WHERE task_id=$1 AND task_inserted_at=$2 AND retry_count=0`, task.ID, task.InsertedAt).Scan(&claimed)
@@ -96,10 +107,11 @@ func TestRecoverWorkerStart(t *testing.T) {
 				}, 12*time.Second, 20*time.Millisecond)
 				if external == target {
 					// Send a duplicate over the current listener after the claim committed.
-					active, err = engine.workers.Get(worker)
-					require.NoError(t, err)
-					session = active[0].sessionID
-					require.NoError(t, active[0].StartTaskFromBulk(ctx, tenant, &repository.V1TaskWithPayload{V1Task: task, Payload: []byte("{}")}, nil))
+					if scenario != "heartbeat_replay" {
+						active = currentListener(active.sessionID)
+					}
+					session = active.sessionID
+					require.NoError(t, active.StartTaskFromBulk(ctx, tenant, &repository.V1TaskWithPayload{V1Task: task, Payload: []byte("{}")}, nil))
 					err = pool.QueryRow(ctx, `SELECT delivery_id, receipt_id FROM v1_worker_delivery WHERE task_id=$1`, task.ID).Scan(&delivery, &receipt)
 					require.NoError(t, err)
 				}
