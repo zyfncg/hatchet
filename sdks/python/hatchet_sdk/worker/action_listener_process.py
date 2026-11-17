@@ -23,7 +23,6 @@ from hatchet_sdk.clients.dispatcher.action_listener import ActionListener
 from hatchet_sdk.clients.dispatcher.dispatcher import DispatcherClient
 from hatchet_sdk.config import ClientConfig
 from hatchet_sdk.contracts.dispatcher_pb2 import (
-    STEP_EVENT_TYPE_STARTED,
     ActionEventResponse,
     StepActionEventType,
 )
@@ -61,6 +60,13 @@ class ActionEvent:
 
 
 @dataclass
+class ActionDequeued:
+    """Local queue timing notification consumed by the listener process."""
+
+    key: str
+
+
+@dataclass
 class QueuedBatchActionEvent:
     """A single lifecycle event (STARTED/FAILED/CANCELLED) covering every task in a batch."""
 
@@ -68,6 +74,8 @@ class QueuedBatchActionEvent:
     type: StepActionEventType
     items: list[BatchEventItem]
 
+
+ListenerEvent = ActionDequeued | ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE
 
 MAX_EVENTS_PER_SEND_LOOP_ITERATION = 1000
 
@@ -82,7 +90,7 @@ class WorkerActionListenerProcess:
         slot_config: dict[str, int],
         config: ClientConfig,
         action_queue: "Queue[Action]",
-        event_queue: "Queue[ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE]",
+        event_queue: "Queue[ListenerEvent]",
         handle_kill: bool,
         debug: bool,
         labels: list[WorkerLabel],
@@ -377,6 +385,7 @@ class WorkerActionListenerProcess:
                 labels=self.labels,
             )
 
+            self.listener.recover_deliveries = True
             logger.debug(f"acquired action listener: {self.listener.worker_id}")
             # Publish the worker_id so the parent process can call the pause API
             # directly without needing to go through this subprocess.
@@ -392,17 +401,16 @@ class WorkerActionListenerProcess:
         self._stop_event_task = asyncio.create_task(self._wait_for_stop_event())
 
     # TODO move event methods to separate class
-    async def _get_event(
-        self, timeout_seconds: float
-    ) -> ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE:
+    async def _get_event(self, timeout_seconds: float) -> ListenerEvent:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, self.event_queue.get, True, timeout_seconds
         )
 
     def _drain_ready_events(
-        self, first_event: ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE
-    ) -> list[ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE]:
+        self,
+        first_event: ListenerEvent,
+    ) -> list[ListenerEvent]:
         events = [first_event]
         with contextlib.suppress(Empty):
             while len(events) < MAX_EVENTS_PER_SEND_LOOP_ITERATION:
@@ -429,6 +437,18 @@ class WorkerActionListenerProcess:
                     logger.debug("stopping event send loop...")
                     stopping = True
                     break
+
+                if isinstance(event, ActionDequeued):
+                    queued_at = self.running_step_runs.pop(event.key, None)
+                    if queued_at is not None:
+                        delay = self.now() - queued_at
+                        if delay > 0.1:
+                            logger.warning(
+                                f"{BLOCKED_THREAD_WARNING} time to start: {delay}s"
+                            )
+                        else:
+                            logger.debug(f"start time: {delay}")
+                    continue
 
                 logger.debug(f"tx: event: {event.action.action_id}/{event.type}")
                 t = asyncio.create_task(self.send_event(event))
@@ -478,30 +498,7 @@ class WorkerActionListenerProcess:
                 return
 
             match event.action.action_type:
-                # FIXME: all events sent from an execution of a function are of type ActionType.START_STEP_RUN since
-                # the action is re-used. We should change this.
                 case ActionType.START_STEP_RUN:
-                    # TODO right now we're sending two start_step_run events
-                    # one on the action loop and one on the event loop
-                    # ideally we change the first to an ack to set the time
-                    if event.type == STEP_EVENT_TYPE_STARTED:
-                        if event.action.step_run_id in self.running_step_runs:
-                            diff = (
-                                self.now()
-                                - self.running_step_runs[event.action.step_run_id]
-                            )
-                            if diff > 0.1:
-                                logger.warning(
-                                    f"{BLOCKED_THREAD_WARNING} time to start: {diff}s"
-                                )
-                            else:
-                                logger.debug(f"start time: {diff}")
-                            del self.running_step_runs[event.action.step_run_id]
-                        else:
-                            self.running_step_runs[event.action.step_run_id] = (
-                                self.now()
-                            )
-
                     send_started_event_task = asyncio.create_task(
                         self.dispatcher_client.send_step_action_event(
                             event.action,
@@ -552,23 +549,9 @@ class WorkerActionListenerProcess:
                 # Process the action here
                 match action.action_type:
                     case ActionType.START_STEP_RUN:
-                        self.event_queue.put(
-                            ActionEvent(
-                                action=action,
-                                type=STEP_EVENT_TYPE_STARTED,  # TODO ack type
-                                payload=None,
-                                should_not_retry=False,
-                            )
-                        )
                         logger.info(
                             f"rx: start step run: {action.step_run_id}/{action.action_id}"
                         )
-
-                        # TODO handle this case better...
-                        if action.step_run_id in self.running_step_runs:
-                            logger.warning(
-                                f"step run already running: {action.step_run_id}"
-                            )
 
                     case ActionType.CANCEL_STEP_RUN:
                         logger.info(f"rx: cancel step run: {action.step_run_id}")
@@ -582,6 +565,8 @@ class WorkerActionListenerProcess:
                         )
                 try:
                     self.action_queue.put(action)
+                    if action.action_type == ActionType.START_STEP_RUN:
+                        self.running_step_runs.setdefault(action.key, self.now())
                 except Exception:
                     logger.exception("error putting action")
 
@@ -638,7 +623,7 @@ def worker_action_listener_process(
     slot_config: dict[str, int],
     config: ClientConfig,
     action_queue: "Queue[Action]",
-    event_queue: "Queue[ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE]",
+    event_queue: "Queue[ListenerEvent]",
     handle_kill: bool,
     debug: bool,
     labels: list[WorkerLabel],

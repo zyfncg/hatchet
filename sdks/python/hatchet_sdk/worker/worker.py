@@ -36,7 +36,7 @@ from hatchet_sdk.utils.aio import gather_max_concurrency
 from hatchet_sdk.utils.typing import STOP_LOOP, STOP_LOOP_TYPE
 from hatchet_sdk.worker.action_listener_process import (
     ActionEvent,
-    QueuedBatchActionEvent,
+    ListenerEvent,
     worker_action_listener_process,
 )
 from hatchet_sdk.worker.runner.run_loop_manager import WorkerActionRunLoopManager
@@ -116,9 +116,7 @@ class Worker:
         self._ctx = multiprocessing.get_context("spawn")
 
         self._action_queue: Queue[Action | STOP_LOOP_TYPE] = self._ctx.Queue()
-        self._event_queue: Queue[
-            ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE
-        ] = self._ctx.Queue()
+        self._event_queue: Queue[ListenerEvent] = self._ctx.Queue()
         self._durable_action_queue: Queue[Action | STOP_LOOP_TYPE] | None = None
         self._durable_event_queue: Queue[ActionEvent | STOP_LOOP_TYPE] | None = None
 
@@ -284,7 +282,7 @@ class Worker:
     @property
     def event_queue(
         self,
-    ) -> "Queue[ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE]":
+    ) -> "Queue[ListenerEvent]":
         warn(
             "The event_queue property is internal and should not be used directly. It will be removed in v2.0.0.",
             DeprecationWarning,

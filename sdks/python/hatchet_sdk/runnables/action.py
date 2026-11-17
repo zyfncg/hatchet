@@ -76,6 +76,8 @@ class BatchEventItem(BaseModel):
 class Action(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    delivery_id: str = ""
+    listener_session_id: str = ""
     worker_id: str
     tenant_id: str
     workflow_run_id: str

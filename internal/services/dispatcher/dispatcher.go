@@ -1017,7 +1017,17 @@ func (d *DispatcherImpl) sendTasksToWorker(
 			failureReasons := make([]dispatchFailureReason, 0, len(workers))
 
 			for i, w := range workers {
-				err := w.StartTaskFromBulk(ctx, tenantId, task.V1TaskWithPayload, task.InvocationCount)
+				disposition, err := w.StartTaskFromBulk(ctx, tenantId, task.V1TaskWithPayload, task.InvocationCount)
+
+				if disposition == startRetained {
+					if err != nil {
+						d.l.Warn().Ctx(ctx).Err(err).Int64("task_id", task.ID).Str("worker_id", workerId.String()).Msg("start write unconfirmed; retaining assignment")
+						if tenantMetricsEnabled {
+							prometheus.EventHooks.RecordDispatch(tenantId.String(), task.Queue, workerId.String(), task.RetryCount, false)
+						}
+					}
+					return nil
+				}
 
 				if err != nil {
 					failureReasons = append(failureReasons, workerSendFailureReason(err))
@@ -1032,36 +1042,11 @@ func (d *DispatcherImpl) sendTasksToWorker(
 			}
 
 			if success {
-				if tenantMetricsEnabled {
-					prometheus.EventHooks.RecordDispatch(tenantId.String(), task.Queue, workerId.String(), task.RetryCount, true)
-				}
-				var durableInvCount int32
+				var invocation int32
 				if task.InvocationCount != nil {
-					durableInvCount = *task.InvocationCount
+					invocation = *task.InvocationCount
 				}
-
-				msg, err := tasktypesv1.MonitoringEventMessageFromInternal(
-					task.TenantID,
-					tasktypesv1.CreateMonitoringEventPayload{
-						TaskId:                 task.ID,
-						RetryCount:             task.RetryCount,
-						DurableInvocationCount: durableInvCount,
-						WorkerId:               &workerId,
-						EventType:              sqlcv1.V1EventTypeOlapSENTTOWORKER,
-						EventTimestamp:         time.Now().UTC(),
-						EventMessage:           "Sent task run to the assigned worker",
-					},
-				)
-
-				if err != nil {
-					d.l.Error().Ctx(ctx).Err(err).Int64("task_id", task.ID).Msg("could not create monitoring event")
-				} else {
-					defer func() {
-						if err := d.pubBuffer.Pub(ctx, msgqueue.OLAP_QUEUE, msg, false); err != nil {
-							d.l.Error().Ctx(ctx).Err(err).Msg("could not publish monitoring event")
-						}
-					}()
-				}
+				d.recordSent(ctx, tenantId, workerId, task.ID, task.Queue, task.RetryCount, invocation)
 
 				return nil
 			}
@@ -1098,6 +1083,23 @@ func (d *DispatcherImpl) sendTasksToWorker(
 	}
 
 	return innerEg.Wait()
+}
+
+func (d *DispatcherImpl) recordSent(ctx context.Context, tenant, worker uuid.UUID, taskID int64, queue string, retry, invocation int32) {
+	if d.promGate.Enabled(ctx, tenant) {
+		prometheus.EventHooks.RecordDispatch(tenant.String(), queue, worker.String(), retry, true)
+	}
+	msg, err := tasktypesv1.MonitoringEventMessageFromInternal(tenant, tasktypesv1.CreateMonitoringEventPayload{
+		TaskId: taskID, RetryCount: retry, DurableInvocationCount: invocation, WorkerId: &worker,
+		EventType: sqlcv1.V1EventTypeOlapSENTTOWORKER, EventTimestamp: time.Now().UTC(),
+		EventMessage: "Sent task run to the assigned worker",
+	})
+	if err == nil {
+		err = d.pubBuffer.Pub(ctx, msgqueue.OLAP_QUEUE, msg, false)
+	}
+	if err != nil {
+		d.l.Error().Ctx(ctx).Err(err).Int64("task_id", taskID).Msg("could not publish sent event")
+	}
 }
 
 func (d *DispatcherImpl) handleRetries(

@@ -3,7 +3,6 @@ import json
 import time
 from collections.abc import AsyncGenerator
 from typing import cast
-from uuid import uuid4
 
 import grpc
 import grpc.aio
@@ -22,7 +21,6 @@ from hatchet_sdk.connection import new_conn
 from hatchet_sdk.contracts.dispatcher_pb2 import ActionType as ActionTypeProto
 from hatchet_sdk.contracts.dispatcher_pb2 import (
     AssignedAction,
-    ClaimDeliveryRequest,
     HeartbeatRequest,
     WorkerListenRequest,
     WorkerUnsubscribeRequest,
@@ -60,6 +58,7 @@ class ActionListener:
     def __init__(self, config: "ClientConfig", worker_id: str) -> None:
         self.config = config
         self.worker_id = worker_id
+        self.recover_deliveries = False
 
         self.aio_client = DispatcherStub(new_conn(self.config, True))
         self.token = self.config.token
@@ -153,10 +152,6 @@ class ActionListener:
 
     async def _generator(self) -> AsyncGenerator[Action | None, None]:
         listener = None
-        # A lost claim reply can mean the engine has already committed the receipt.
-        # Keep both the action and the exact request until its outcome is known.
-        pending: tuple[ClaimDeliveryRequest, Action] | None = None
-
         while not self.stop_signal:
             if listener is not None:
                 listener.cancel()
@@ -170,18 +165,6 @@ class ActionListener:
 
             try:
                 while not self.stop_signal:
-                    if pending is not None:
-                        request, action = pending
-                        response = await self.aio_client.ClaimDelivery(
-                            request,
-                            timeout=5,
-                            metadata=create_authorization_header(self.token),
-                        )
-                        pending = None
-                        if response.accepted:
-                            yield action
-                        continue
-
                     self.interrupt = ThreadSafeEvent()
 
                     t = asyncio.create_task(
@@ -251,6 +234,8 @@ class ActionListener:
                             trigger_time=assigned_action.batchStartPayload.triggerTime.ToDatetime(),
                         )
                     action = Action(
+                        delivery_id=assigned_action.delivery_id,
+                        listener_session_id=assigned_action.listener_session_id,
                         tenant_id=assigned_action.tenant_id,
                         worker_id=self.worker_id,
                         workflow_run_id=assigned_action.workflow_run_id,
@@ -291,33 +276,9 @@ class ActionListener:
                         batch_start=batch_start_payload,
                     )
 
-                    if assigned_action.delivery_id:
-                        pending = (
-                            ClaimDeliveryRequest(
-                                worker_id=self.worker_id,
-                                listener_session_id=assigned_action.listener_session_id,
-                                delivery_id=assigned_action.delivery_id,
-                                receipt_id=str(uuid4()),
-                            ),
-                            action,
-                        )
-                    else:
-                        yield action
+                    yield action
             except grpc.RpcError as e:
                 self.last_heartbeat_succeeded = False
-
-                if pending is not None:
-                    if e.code() not in (
-                        grpc.StatusCode.UNAVAILABLE,
-                        grpc.StatusCode.DEADLINE_EXCEEDED,
-                        grpc.StatusCode.CANCELLED,
-                        grpc.StatusCode.INTERNAL,
-                        grpc.StatusCode.UNKNOWN,
-                    ):
-                        raise
-                    self.retries += 1
-                    logger.debug("claim interrupted; reconnecting to confirm receipt")
-                    continue
 
                 # Handle different types of errors
                 if e.code() == grpc.StatusCode.CANCELLED:
@@ -344,12 +305,16 @@ class ActionListener:
             self.retries = 0
 
         if self.retries > DEFAULT_ACTION_LISTENER_RETRY_COUNT:
-            # TODO this is the problem case...
-            logger.error(
-                f"could not establish action listener connection after {DEFAULT_ACTION_LISTENER_RETRY_COUNT} retries"
-            )
-            self.run_heartbeat = False
-            raise Exception("retry_exhausted")
+            # A live runner may still own long tasks while its stream is down.
+            # Keep reconnecting with capped backoff and continue heartbeating.
+            if self.recover_deliveries:
+                self.retries = DEFAULT_ACTION_LISTENER_RETRY_COUNT
+            else:
+                logger.error(
+                    f"could not establish action listener connection after {DEFAULT_ACTION_LISTENER_RETRY_COUNT} retries"
+                )
+                self.run_heartbeat = False
+                raise Exception("retry_exhausted")
         if self.retries >= 1:
             # logger.info
             # if we are retrying, we wait for a bit. this should eventually be replaced with exp backoff + jitter
@@ -364,7 +329,9 @@ class ActionListener:
         self.aio_client = DispatcherStub(new_conn(self.config, True))
 
         listener = self.aio_client.ListenV2(
-            WorkerListenRequest(worker_id=self.worker_id, recover_deliveries=True),
+            WorkerListenRequest(
+                worker_id=self.worker_id, recover_deliveries=self.recover_deliveries
+            ),
             timeout=self.config.listener_v2_timeout,
             metadata=create_authorization_header(self.token),
         )

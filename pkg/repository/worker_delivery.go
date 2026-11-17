@@ -14,7 +14,16 @@ import (
 type WorkerDeliveries interface {
 	SaveWorkerDelivery(context.Context, uuid.UUID, uuid.UUID, *sqlcv1.V1Task, []byte) (uuid.UUID, error)
 	PendingWorkerDeliveries(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) ([]WorkerDelivery, error)
-	ClaimWorkerDelivery(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (bool, error)
+	ClaimWorkerDelivery(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) (WorkerClaim, error)
+}
+
+// WorkerClaim distinguishes the first successful claim from a confirmed retry.
+type WorkerClaim struct {
+	Accepted   bool
+	First      bool
+	TaskID     int64
+	RetryCount int32
+	Queue      string
 }
 
 type WorkerDelivery struct {
@@ -54,18 +63,30 @@ func (w *workerRepository) PendingWorkerDeliveries(ctx context.Context, tenant, 
 	return pgx.CollectRows(rows, pgx.RowToStructByPos[WorkerDelivery])
 }
 
-func (w *workerRepository) ClaimWorkerDelivery(ctx context.Context, tenant, worker, session, delivery, receipt uuid.UUID) (bool, error) {
-	// Compare against the live assignment as well as the receipt. A retry of a lost
-	// RPC response uses the same receipt; a second copy of the start uses a new one.
-	tag, err := w.pool.Exec(ctx, `
-		UPDATE v1_worker_delivery d SET receipt_id = $5, action = NULL
-		FROM v1_task_runtime r, "Worker" w
-		WHERE d.tenant_id = $1 AND d.worker_id = $2 AND d.delivery_id = $4
-			AND (r.task_id, r.task_inserted_at, r.retry_count, r.tenant_id, r.worker_id)
-			  = (d.task_id, d.task_inserted_at, d.retry_count, d.tenant_id, d.worker_id)
-			AND r.timeout_at > now()
-			AND w.id = d.worker_id AND w."tenantId" = d.tenant_id
-			AND (d.receipt_id = $5 OR (d.receipt_id IS NULL AND w."isActive" AND w."lastListenerSessionId" = $3))`,
-		tenant, worker, session, delivery, receipt)
-	return tag.RowsAffected() == 1, err
+func (w *workerRepository) ClaimWorkerDelivery(ctx context.Context, tenant, worker, session, delivery, receipt uuid.UUID) (WorkerClaim, error) {
+	var claim WorkerClaim
+	err := w.pool.QueryRow(ctx, `
+		WITH owned AS MATERIALIZED (
+			SELECT d.delivery_id, d.receipt_id, d.task_id, d.retry_count, t.queue,
+				w."isActive" AND w."lastListenerSessionId" = $3 AS current_session
+			FROM v1_worker_delivery d
+			JOIN v1_task_runtime r USING (task_id, task_inserted_at, retry_count, tenant_id, worker_id)
+			JOIN v1_task t ON (t.id, t.inserted_at) = (d.task_id, d.task_inserted_at)
+			JOIN "Worker" w ON w.id = d.worker_id AND w."tenantId" = d.tenant_id
+			WHERE d.tenant_id = $1 AND d.worker_id = $2 AND d.delivery_id = $4
+				AND r.timeout_at > now()
+			FOR UPDATE OF d
+		), claimed AS (
+			UPDATE v1_worker_delivery d SET receipt_id = $5, action = NULL
+			FROM owned o WHERE d.delivery_id = o.delivery_id
+				AND o.receipt_id IS NULL AND o.current_session
+			RETURNING d.delivery_id
+		)
+		SELECT EXISTS (SELECT FROM claimed) OR receipt_id IS NOT DISTINCT FROM $5,
+			EXISTS (SELECT FROM claimed), task_id, retry_count, queue FROM owned`,
+		tenant, worker, session, delivery, receipt).Scan(&claim.Accepted, &claim.First, &claim.TaskID, &claim.RetryCount, &claim.Queue)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WorkerClaim{}, nil
+	}
+	return claim, err
 }

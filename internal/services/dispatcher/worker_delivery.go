@@ -11,21 +11,23 @@ import (
 	"github.com/hatchet-dev/hatchet/pkg/repository/sqlcv1"
 )
 
-func (worker *subscribedWorker) sendRecoverableStart(ctx context.Context, tenant uuid.UUID, task *sqlcv1.V1Task, action *contracts.AssignedAction) error {
+func (worker *subscribedWorker) sendRecoverableStart(ctx context.Context, tenant uuid.UUID, task *sqlcv1.V1Task, action *contracts.AssignedAction) (startDisposition, error) {
 	data, err := proto.Marshal(action)
 	if err != nil {
-		return err
+		return startNotSent, err
 	}
 	id, err := worker.deliveries.SaveWorkerDelivery(ctx, tenant, worker.workerId, task, data)
-	if err != nil || id == uuid.Nil {
-		return err
+	if err != nil {
+		return startNotSent, err
+	}
+	if id == uuid.Nil {
+		return startRetained, nil
 	}
 	action.DeliveryId = id.String()
 	action.ListenerSessionId = worker.sessionID.String()
 	// The committed delivery now belongs to this worker. A transport error can
 	// race a successful claim; only the runtime owner may retire the attempt.
-	_ = worker.sendToWorker(ctx, action)
-	return nil
+	return startRetained, worker.sendToWorker(ctx, action)
 }
 
 func (worker *subscribedWorker) recoverDeliveries(ctx context.Context, tenant uuid.UUID) error {
@@ -69,9 +71,16 @@ func (s *DispatcherImpl) ClaimDelivery(ctx context.Context, req *contracts.Claim
 	}
 
 	tenant := ctx.Value("tenant").(*sqlcv1.Tenant)
-	accepted, err := s.repov1.Workers().ClaimWorkerDelivery(ctx, tenant.ID, worker, session, delivery, receipt)
+	claim, err := s.repov1.Workers().ClaimWorkerDelivery(ctx, tenant.ID, worker, session, delivery, receipt)
 	if err != nil {
 		return nil, err
 	}
-	return &contracts.ClaimDeliveryResponse{Accepted: accepted}, nil
+	if claim.First {
+		// A client can cancel the RPC after the claim commits. Publish the
+		// observation even if this particular reply can no longer reach it.
+		eventCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), HeartbeatInterval)
+		defer cancel()
+		s.recordSent(eventCtx, tenant.ID, worker, claim.TaskID, claim.Queue, claim.RetryCount, 0)
+	}
+	return &contracts.ClaimDeliveryResponse{Accepted: claim.Accepted}, nil
 }

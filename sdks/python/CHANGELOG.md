@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Recover individual task starts after a listener disconnect when the engine supports delivery claims. Duplicate deliveries and retried claim acknowledgements invoke the handler once.
+- Recover individual non-durable task starts across listener disconnects and queue handoff failures when the engine supports delivery claims. The runner claims each attempt after dequeue, reports its start once, and retries a lost claim response without interrupting the listener heartbeat.
 
 ## [1.42.1] - 2026-10-09
 

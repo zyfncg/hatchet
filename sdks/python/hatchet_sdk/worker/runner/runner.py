@@ -74,9 +74,10 @@ from hatchet_sdk.serde import HATCHET_PYDANTIC_SENTINEL
 from hatchet_sdk.types.labels import WorkerLabel
 from hatchet_sdk.utils.cache import BoundedDict
 from hatchet_sdk.utils.serde import remove_null_unicode_character
-from hatchet_sdk.utils.typing import STOP_LOOP_TYPE
 from hatchet_sdk.worker.action_listener_process import (
+    ActionDequeued,
     ActionEvent,
+    ListenerEvent,
     QueuedBatchActionEvent,
 )
 from hatchet_sdk.worker.durable_eviction.cache import DurableRunRecord
@@ -117,7 +118,7 @@ class WorkerStatus(Enum):
 class Runner:
     def __init__(
         self,
-        event_queue: "Queue[ActionEvent | QueuedBatchActionEvent | STOP_LOOP_TYPE]",
+        event_queue: "Queue[ListenerEvent]",
         config: ClientConfig,
         slots: int,
         durable_slots: int,
@@ -138,6 +139,7 @@ class Runner:
         self.slots = slots
         self.durable_slots = durable_slots
         self.tasks: dict[ActionKey, asyncio.Task[Any]] = {}  # Store run ids and futures
+        self.pending_claims: dict[ActionKey, asyncio.Task[Any]] = {}
         self.contexts: dict[ActionKey, Context] = {}  # Store run ids and contexts
         self.cancellations = BoundedDict[str, bool](maxsize=1000)
         self.action_registry = action_registry or {}
@@ -232,6 +234,7 @@ class Runner:
             case ActionType.START_STEP_RUN:
                 log = f"run: start step: {action.action_id}/{action.step_run_id}"
                 logger.info(log)
+                self.event_queue.put(ActionDequeued(action.key))
                 t = asyncio.create_task(self.handle_start_step_run(action))
             case ActionType.CANCEL_STEP_RUN:
                 log = f"cancel: step run:  {action.action_id}/{action.step_run_id}/{action.retry_count}"
@@ -836,6 +839,24 @@ class Runner:
         action_func = self.action_registry.get(action_name)
 
         if action_func:
+            if action.delivery_id:
+                if (
+                    action.key in self.pending_claims
+                    or action.key in self.cancellations
+                ):
+                    return None
+                current = asyncio.current_task()
+                assert current is not None
+                self.pending_claims[action.key] = current
+                try:
+                    if not await self.dispatcher_client.claim_delivery(action):
+                        return None
+                except Exception as exc:
+                    logger.exception(f"could not claim delivery for {action.key}")
+                    return exc
+                finally:
+                    self.pending_claims.pop(action.key, None)
+
             context = self.create_context(
                 action=action,
                 task=action_func,
@@ -920,6 +941,10 @@ class Runner:
     async def handle_cancel_action(self, action: Action) -> None:
         key = action.key
         try:
+            pending = self.pending_claims.get(key)
+            if pending is not None:
+                self.cancellations[key] = True
+                pending.cancel()
             # call cancel to signal the context to stop
             if key in self.contexts:
                 self.contexts[key]._set_cancellation_flag()
@@ -991,8 +1016,8 @@ class Runner:
             logger.info(f"evicted {evicted} waiting durable run(s) during shutdown")
 
     async def wait_for_tasks(self) -> None:
-        running = len(self.tasks.keys())
+        running = len(self.tasks) + len(self.pending_claims)
         while running > 0:
             logger.info(f"waiting for {running} tasks to finish...")
             await asyncio.sleep(1)
-            running = len(self.tasks.keys())
+            running = len(self.tasks) + len(self.pending_claims)

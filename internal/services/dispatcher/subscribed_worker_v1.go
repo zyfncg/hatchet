@@ -26,14 +26,23 @@ var (
 	errWorkerPaused      = errors.New("worker session is paused, the task is returned to the queue")
 )
 
+type startDisposition int
+
+const (
+	startNotSent startDisposition = iota
+	startWritten
+	// Keep the current assignment, including when a legacy write times out.
+	startRetained
+)
+
 func (worker *subscribedWorker) StartTaskFromBulk(
 	ctx context.Context,
 	tenantId uuid.UUID,
 	task *v1.V1TaskWithPayload,
 	durableInvocationCount *int32,
-) error {
+) (startDisposition, error) {
 	if ctx.Err() != nil {
-		return fmt.Errorf("context done before starting task: %w", ctx.Err())
+		return startNotSent, fmt.Errorf("context done before starting task: %w", ctx.Err())
 	}
 
 	ctx, span := telemetry.NewSpan(ctx, "start-step-run-from-bulk") // nolint:ineffassign
@@ -58,17 +67,16 @@ func (worker *subscribedWorker) StartTaskFromBulk(
 	err := worker.sendToWorker(ctx, action)
 
 	if err != nil {
-		// if the context is done, we return nil, because the worker took too long to receive the message, and we're not
-		// sure if the worker received it or not. this is equivalent to a network drop, and would be resolved by worker-side
-		// acks, which we don't currently have.
+		// A legacy listener may have received the action before the deadline.
+		// Preserve its assignment without reporting a confirmed write.
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil
+			return startRetained, err
 		}
 
-		return fmt.Errorf("could not send start action to worker: %w", err)
+		return startNotSent, fmt.Errorf("could not send start action to worker: %w", err)
 	}
 
-	return nil
+	return startWritten, nil
 }
 
 func (worker *subscribedWorker) StartBatch(ctx context.Context, action *contracts.AssignedAction) error {

@@ -2,6 +2,7 @@ import platform
 from importlib.metadata import version
 from sys import version_info
 from typing import cast
+from uuid import uuid4
 
 import grpc.aio
 import tenacity
@@ -18,6 +19,7 @@ from hatchet_sdk.contracts.dispatcher_pb2 import (
     ActionEventResponse,
     BatchActionEvent,
     BatchActionEventItem,
+    ClaimDeliveryRequest,
     GetVersionRequest,
     GetVersionResponse,
     OverridesData,
@@ -64,6 +66,39 @@ class DispatcherClient:
             self.aio_client = DispatcherStub(self.aio_channel)
 
         return self.aio_client
+
+    async def claim_delivery(self, action: Action) -> bool:
+        request = ClaimDeliveryRequest(
+            worker_id=action.worker_id,
+            delivery_id=action.delivery_id,
+            listener_session_id=action.listener_session_id,
+            receipt_id=str(uuid4()),
+        )
+        # Keep the receipt across ambiguous RPC outcomes. A fresh channel on
+        # retry is private to this claim and never interrupts other runner RPCs.
+        async for attempt in tenacity.AsyncRetrying(
+            retry=tenacity.retry_if_exception(tenacity_should_retry),
+            wait=tenacity.wait_exponential_jitter(initial=0.25, max=4),
+            before_sleep=tenacity_before_sleep,
+            reraise=True,
+        ):
+            with attempt:
+                if attempt.retry_state.attempt_number == 1:
+                    stub = self._get_or_create_aio_client()
+                    response = await stub.ClaimDelivery(
+                        request,
+                        timeout=5,
+                        metadata=create_authorization_header(self.token),
+                    )
+                else:
+                    async with new_conn(self.config, True) as channel:
+                        response = await DispatcherStub(channel).ClaimDelivery(
+                            request,
+                            timeout=5,
+                            metadata=create_authorization_header(self.token),
+                        )
+                return bool(response.accepted)
+        raise AssertionError("claim retries ended without a response")
 
     async def get_action_listener(
         self,

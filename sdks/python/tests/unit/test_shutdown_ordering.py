@@ -11,7 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from hatchet_sdk.clients.dispatcher.action_listener import ActionListener
+from hatchet_sdk.clients.dispatcher.action_listener import (
+    DEFAULT_ACTION_LISTENER_RETRY_COUNT,
+    ActionListener,
+)
 from hatchet_sdk.config import ClientConfig, HealthcheckConfig
 from hatchet_sdk.runnables.action import ActionType
 from hatchet_sdk.utils.typing import STOP_LOOP
@@ -96,6 +99,22 @@ def _make_listener(worker_id: str = "test-worker-id") -> ActionListener:
         side_effect=Exception("no gRPC server in tests")
     )
     return listener
+
+
+async def test_reconnecting_listener_keeps_heartbeat_after_retry_limit() -> None:
+    with (
+        patch(f"{_ACTION_LISTENER_MODULE}.new_conn"),
+        patch(f"{_ACTION_LISTENER_MODULE}.exp_backoff_sleep", new_callable=AsyncMock),
+    ):
+        listener = ActionListener(config=MagicMock(), worker_id="recoverable-worker")
+        listener.recover_deliveries = True
+        listener.retries = DEFAULT_ACTION_LISTENER_RETRY_COUNT + 1
+        listener.last_connection_attempt = time.time()
+        with patch.object(listener, "start_heartbeater", new_callable=AsyncMock):
+            stream = await listener.get_listen_client()
+        assert stream is not None
+        assert listener.run_heartbeat
+        assert listener.retries == DEFAULT_ACTION_LISTENER_RETRY_COUNT
 
 
 def _make_process(
